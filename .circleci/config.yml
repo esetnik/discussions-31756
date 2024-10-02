@@ -1,0 +1,791 @@
+# cspell:word elif,circleci,cimg,xlarge
+version: 2.1
+parameters:
+  GHA_Actor:
+    type: string
+    default: ""
+  GHA_Action:
+    type: string
+    default: ""
+  GHA_Event:
+    type: string
+    default: ""
+  GHA_Meta:
+    type: string
+    default: ""
+aliases:
+  # Shallow Clone
+  - &checkout-shallow
+    name: Checkout
+    command: |
+      #!/bin/sh
+      set -e
+
+      # Workaround old docker images with incorrect $HOME
+      # check https://github.com/docker/docker/issues/2968 for details
+      if [ "${HOME}" = "/" ]
+      then
+        # cspell:word getent passwd
+        export HOME=$(getent passwd $(id -un) | cut -d: -f6)
+      fi
+
+      # cspell:word mkdir
+      mkdir -p ~/.ssh
+
+      # Obtain github.com ssh public keys and add to known_hosts
+      curl -L https://api.github.com/meta | jq -r '.ssh_keys | .[]' | sed -e 's/^/github.com /' >> ~/.ssh/known_hosts
+
+      # cspell:word umask, chmod
+      (umask 077; touch ~/.ssh/id_rsa)
+      chmod 0600 ~/.ssh/id_rsa
+      (cat \<<EOF > ~/.ssh/id_rsa
+      $CHECKOUT_KEY
+      EOF
+      )
+
+      # use git+ssh instead of https
+      git config --global url."ssh://git@github.com".insteadOf "https://github.com" || true
+
+      if [ -e ~/prodigy/.git ]
+      then
+          cd ~/prodigy
+          git remote set-url origin "$CIRCLE_REPOSITORY_URL" || true
+      else
+          mkdir -p ~/prodigy
+          cd ~/prodigy
+          git clone --depth=1 "$CIRCLE_REPOSITORY_URL" .
+      fi
+
+      if [ -n "$CIRCLE_TAG" ]
+      then
+        git fetch --depth=10 --force origin "refs/tags/${CIRCLE_TAG}"
+      elif [[ "$CIRCLE_BRANCH" =~ ^pull\/* ]]
+      then
+      # For PR from Fork
+        git fetch --depth=10 --force origin "$CIRCLE_BRANCH/head:remotes/origin/$CIRCLE_BRANCH"
+      else
+        git fetch --depth=10 --force origin "$CIRCLE_BRANCH:remotes/origin/$CIRCLE_BRANCH"
+      fi
+
+      if [ -n "$CIRCLE_TAG" ]
+      then
+          git reset --hard "$CIRCLE_SHA1"
+          git checkout -q "$CIRCLE_TAG"
+      elif [ -n "$CIRCLE_BRANCH" ]
+      then
+          git reset --hard "$CIRCLE_SHA1"
+          git checkout -q -B "$CIRCLE_BRANCH"
+      fi
+
+      git reset --hard "$CIRCLE_SHA1"
+
+yarn-install: &yarn-install
+  run:
+    name: yarn install
+    command: |
+      for i in $(seq 1 5); do \
+      yarn install --frozen-lockfile --cache-folder ~/.cache/yarn \
+      && s=0 && break || s=$? && sleep 10; done; (exit $s)
+    working_directory: ~/prodigy/frontend
+
+yarn-install-unicorn: &yarn-install-unicorn
+  run:
+    name: yarn install
+    command: |
+      for i in $(seq 1 5); do \
+      yarn install --frozen-lockfile --cache-folder ~/.cache/yarn \
+      && s=0 && break || s=$? && sleep 10; done; (exit $s)
+    working_directory: ~/prodigy/node
+
+restore-cache: &restore-cache
+  restore_cache:
+    keys:
+      - v1-repo-{{ .Environment.CIRCLE_BRANCH}}-{{ .Environment.CIRCLE_SHA1 }}
+
+restore-eslint-cache: &restore-eslint-cache
+  restore_cache:
+    name: Restore eslint cache
+    keys:
+      - &eslint-cache v1-eslintcache-{{ .Environment.CIRCLE_BRANCH}}-{{ .Environment.CIRCLE_SHA1 }}
+      - v1-eslintcache-{{ .Environment.CIRCLE_BRANCH}}
+      - v1-eslintcache-
+
+save-eslint-cache: &save-eslint-cache
+  save_cache:
+    name: Save eslint cache
+    key: *eslint-cache
+    paths:
+      - frontend/.eslintcache
+
+restore-cspell-cache: &restore-cspell-cache
+  restore_cache:
+    name: Restore cspell cache
+    keys:
+      - &cspell-cache v1-cspellcache-{{ .Environment.CIRCLE_BRANCH}}-{{ .Environment.CIRCLE_SHA1 }}
+      - v1-cspellcache-{{ .Environment.CIRCLE_BRANCH}}
+      - v1-cspellcache
+
+save-cspell-cache: &save-cspell-cache
+  save_cache:
+    name: Save cspell cache
+    key: *cspell-cache
+    paths:
+      - .cspellcache
+
+ecs-cli-configure: &ecs-cli-configure
+  run:
+    name: ecs-cli configure
+    command: |
+      ecs-cli configure --cluster ${ECS_CLUSTER_NAME} \
+        --region ${AWS_REGION} \
+        --default-launch-type FARGATE \
+        --config-name prodigy_cluster_config
+
+ecr-get-login: &ecr-get-login
+  run:
+    name: aws ecr get-login-password
+    command: |
+      for i in $(seq 1 5); do aws ecr get-login-password \
+        | docker login \
+        --username AWS \
+        --password-stdin \
+      ${ECR_ENDPOINT} && s=0 && break || s=$? && sleep 10; done; (exit $s)
+
+build-image: &build-image
+  run:
+    name: Build ${IMAGE_NAME} image
+    command: |
+      for i in $(seq 1 5); do \
+        docker compose \
+          --compatibility \
+          --verbose \
+          -f docker-compose.yml \
+          -f docker-compose-e2e.yml \
+          build ${IMAGE_NAME} \
+          --build-arg BUILDKIT_INLINE_CACHE=1 \
+          --progress plain \
+      && s=0 && break || s=$? && sleep 10; done; (exit $s)
+
+push-image: &push-image
+  run:
+    name: Push ${IMAGE_NAME} image
+    command: |
+      ECR_IMAGE_TAG=${ECR_ENDPOINT}/prodigy_${IMAGE_NAME}
+      echo pushing image "${ECR_IMAGE_TAG}:${CIRCLE_SHA1}" to registry
+      docker tag prodigy_${IMAGE_NAME} ${ECR_IMAGE_TAG}:${CIRCLE_SHA1}
+      docker tag prodigy_${IMAGE_NAME} ${ECR_IMAGE_TAG}:latest
+      docker push ${ECR_IMAGE_TAG}:latest | cat
+      docker push ${ECR_IMAGE_TAG}:${CIRCLE_SHA1} | cat
+
+build_docker: &build-docker
+  working_directory: /home/circleci/prodigy
+  executor: prodigyems-docker
+  environment:
+    DOCKER_BUILDKIT: 1
+    COMPOSE_DOCKER_CLI_BUILD: 1
+  steps:
+    - *restore-cache
+    - setup_remote_docker:
+        docker_layer_caching: false
+        version: default
+    - *ecr-get-login
+    - *build-image
+    - *push-image
+
+deploy-requires: &deploy-requires
+  requires:
+    - test_e2e
+    - test_frontend
+
+build-requires: &build-requires
+  requires:
+    - lint_web
+    - lint_unicorn
+    - lint_frontend
+    - test_frontend
+
+docker-container: &docker-container
+  executor: prodigyems-docker
+  working_directory: /home/circleci/prodigy
+
+migrate: &migrate
+  <<: *docker-container
+  steps:
+    - <<: *restore-cache
+    - <<: *ecs-cli-configure
+    - run:
+        name: Run migrate on ECS fargate
+        command: |
+          # add -u option to fail on uninitialized variables
+          set -euo pipefail
+          ecs-cli compose \
+            --debug \
+            --project-name migrate \
+            --file docker-compose-ecs-migrate.yml \
+            --ecs-params ecs-params-${ENV}-migrate.yml \
+            start \
+            --cluster-config prodigy_cluster_config \
+            --create-log-groups | tee ecs_output.txt
+
+          # Extract the TASK_ID from the saved output using awk
+          TASK_ID=$(awk -F'/' '/Starting container.../ {print $2}' ecs_output.txt)
+          echo "Extracted TASK_ID: $TASK_ID"
+
+          SUCCESS_LOG_FOUND=0  # A flag to check if the desired log output is found
+          TIMEOUT_ITERATIONS=24  # 5 seconds * 24 iterations = 120 seconds
+          COUNTER=0
+
+          while [ $COUNTER -lt $TIMEOUT_ITERATIONS ]; do
+              LOG_OUTPUT=$(ecs-cli logs --task-id $TASK_ID --container-name migrate --cluster-config prodigy_cluster_config 2>&1)
+              echo "$LOG_OUTPUT"  # Echo the log output during each iteration
+              
+              # Check the log for the desired pattern
+              if echo "$LOG_OUTPUT" | grep -E "Applied [0-9]+ migration[s]?"; then
+                  SUCCESS_LOG_FOUND=1
+                  break
+              fi
+              
+              sleep 5
+              COUNTER=$((COUNTER+1))
+          done
+
+          # If the desired log output wasn't found within the timeout, fail the script
+          if [ $SUCCESS_LOG_FOUND -eq 0 ]; then
+              echo "Failed to find the success log output within 120 seconds."
+              exit 1
+          fi
+
+          # Loop to keep checking the task status once it's RUNNING
+          TASK_STATUS="RUNNING"
+          MAX_ITERATIONS=10
+          COUNTER=0
+          EXIT_CODE=""
+
+          while [ "$TASK_STATUS" != "STOPPED" ] && [ $COUNTER -lt $MAX_ITERATIONS ]; do
+              echo "Waiting for the task to complete..."
+              sleep 5
+              PS_OUTPUT=$(ecs-cli ps --cluster-config prodigy_cluster_config | grep $TASK_ID | grep "migrate")
+              echo $PS_OUTPUT
+              
+              # Check if 'ExitCode' is present in the output
+              if echo "$PS_OUTPUT" | grep -q "ExitCode"; then
+                  EXIT_CODE=$(echo $PS_OUTPUT | awk -F'ExitCode: ' '{print $2}' | awk '{print $1}')
+                  echo "Task Exit Code: $EXIT_CODE"
+                  break
+              fi
+              
+              TASK_STATUS=$(echo $PS_OUTPUT | awk '{print $4}')
+              echo "Current task status: $TASK_STATUS"
+              COUNTER=$((COUNTER+1))
+          done
+
+          # the task is done at this point
+
+          # Check if the loop exited because of the max iterations without detecting ExitCode
+          if [ $COUNTER -eq $MAX_ITERATIONS ] && [ -z "$EXIT_CODE" ]; then
+              echo "Reached maximum iterations without detecting an ExitCode."
+              exit 1
+          fi
+
+deploy-web: &deploy-web
+  <<: *docker-container
+  steps:
+    - <<: *restore-cache
+    - <<: *ecs-cli-configure
+    - run:
+        name: Deploy web to ECS fargate
+        command: |
+          ecs-cli compose \
+            --debug \
+            --project-name web \
+            --file docker-compose-ecs-web.yml \
+            --ecs-params ecs-params-${ENV}-web.yml \
+            service up \
+            --cluster-config prodigy_cluster_config \
+            --deployment-max-percent 200 \
+            --deployment-min-healthy-percent 100 \
+            --health-check-grace-period 600 \
+            --target-group-arn ${TARGET_GROUP_ARN} \
+            --container-name web \
+            --container-port 80 \
+            --create-log-groups \
+            --timeout 15 \
+            --force-deployment
+
+deploy-jobs: &deploy-jobs
+  <<: *docker-container
+  steps:
+    - <<: *restore-cache
+    - <<: *ecs-cli-configure
+    - run:
+        name: Deploy jobs to ECS fargate
+        command: |
+          ecs-cli compose \
+            --debug \
+            --project-name jobs \
+            --file docker-compose-ecs-jobs.yml \
+            --ecs-params ecs-params-${ENV}-jobs.yml \
+            service up \
+            --cluster-config prodigy_cluster_config \
+            --deployment-max-percent 200 \
+            --deployment-min-healthy-percent 100 \
+            --create-log-groups \
+            --timeout 15 \
+            --force-deployment
+
+deploy-frontend: &deploy-frontend
+  docker:
+    - image: cimg/node:20.15.1@sha256:0185d41227bb532ca32fe2ba7c28c950fcc3f81ce68542e7ad86e689b969a78e
+  working_directory: ~/prodigy
+  steps:
+    - *restore-cache
+    - run:
+        name: trigger netlify branch deploy
+        command: curl -X POST -d '{}' "${NETLIFY_HOOK_URL}?trigger_branch=${CIRCLE_BRANCH}&trigger_title=triggered+by+circleci"
+        working_directory: ~/prodigy/frontend
+
+jobs:
+  checkout_code:
+    docker:
+      - image: cimg/node:20.15.1@sha256:0185d41227bb532ca32fe2ba7c28c950fcc3f81ce68542e7ad86e689b969a78e
+    working_directory: ~/prodigy
+    environment:
+      GIT_LFS_SKIP_SMUDGE: 1
+    steps:
+      - run:
+          name: install git-lfs
+          command: sudo apt-get update && sudo apt-get install -y git-lfs
+      - run: *checkout-shallow
+      # cache git-lfs to save bandwidth
+      #  see https://www.develer.com/en/avoiding-git-lfs-bandwidth-waste-with-github-and-circleci/
+      - run:
+          command: |
+            git lfs ls-files -l | cut -d' ' -f1 | sort > .assets-id
+      - restore_cache:
+          key: v1-my-cache-key-{{ checksum ".assets-id" }}
+      - run:
+          command: |
+            git lfs pull
+      - save_cache:
+          key: v1-my-cache-key-{{ checksum ".assets-id" }}
+          paths:
+            - .git/lfs
+      - save_cache:
+          key: v1-repo-{{ .Environment.CIRCLE_BRANCH}}-{{ .Environment.CIRCLE_SHA1 }}
+          paths:
+            - ~/prodigy
+  lint_frontend:
+    docker:
+      - image: cimg/node:20.15.1@sha256:0185d41227bb532ca32fe2ba7c28c950fcc3f81ce68542e7ad86e689b969a78e
+    resource_class: xlarge
+    working_directory: ~/prodigy
+    steps:
+      - *restore-cache
+      - *yarn-install
+      - *restore-cspell-cache
+      - run:
+          name: spellcheck
+          command: yarn spellcheck
+          working_directory: ~/prodigy/frontend
+      - *save-cspell-cache
+      - *restore-eslint-cache
+      - run:
+          name: lint
+          command: yarn lint
+          working_directory: ~/prodigy/frontend
+      - *save-eslint-cache
+      - run:
+          name: typecheck
+          command: yarn typecheck
+          working_directory: ~/prodigy/frontend
+      - run:
+          name: validate translations
+          command: yarn validate:translations
+          working_directory: ~/prodigy/frontend
+      - run:
+          name: validate themes
+          command: yarn validate:themes
+          working_directory: ~/prodigy/frontend
+      - run:
+          name: validate percy
+          command: yarn validate:percy
+          working_directory: ~/prodigy/frontend
+  lint_unicorn:
+    docker:
+      - image: cimg/node:20.15.1@sha256:0185d41227bb532ca32fe2ba7c28c950fcc3f81ce68542e7ad86e689b969a78e
+    working_directory: ~/prodigy
+    steps:
+      - *restore-cache
+      - *yarn-install-unicorn
+      - run:
+          name: lint
+          command: yarn lint
+          working_directory: ~/prodigy/node
+      - run:
+          name: typecheck
+          command: yarn typecheck
+          working_directory: ~/prodigy/node
+  test_frontend:
+    docker:
+      - image: cimg/node:20.15.1@sha256:0185d41227bb532ca32fe2ba7c28c950fcc3f81ce68542e7ad86e689b969a78e
+    working_directory: ~/prodigy
+    steps:
+      - *restore-cache
+      - *yarn-install
+      - run:
+          name: Run unit tests
+          command: yarn test
+          working_directory: ~/prodigy/frontend
+  test_e2e:
+    parallelism: 7
+    machine:
+      image: ubuntu-2404:2024.05.1
+    resource_class: large
+    working_directory: ~/prodigy
+    steps:
+      - *restore-cache
+      - run:
+          name: configure file watchers
+          # cspell:word sysctl,inotify
+          command: sudo sysctl fs.inotify.max_user_watches=524288
+      - *ecr-get-login
+      - run:
+          name: Setup Environment Variables
+          # CIRCLE_PULL_REQUEST is the correct variable, see
+          # https://support.circleci.com/hc/en-us/articles/360047521451-Why-is-CIRCLE-PR-NUMBER-empty-?utm_source=google&utm_medium=sem&utm_campaign=sem-google-dg--uscan-en-dsa-tROAS-auth-nb&utm_term=g_-_c__dsa_&utm_content=&gclid=CjwKCAjw5pShBhB_EiwAvmnNVxBpDmig-4SeSzLBm9lrRq6boO857t-nySaAEnJvzdhPX0aayR9ypBoCsPoQAvD_BwE
+          # https://circleci.com/docs/env-vars/#:~:text=Another%20possible%20method%20to%20interpolate%20values%20into%20your%20configuration%20is%20to%20use%20a%20run%20step%20to%20export%20environment%20variables%20to%20BASH_ENV%2C%20as%20shown%20below.
+          command: |
+            echo 'export PERCY_PULL_REQUEST="${CIRCLE_PULL_REQUEST##*/}"' >> "$BASH_ENV"
+            echo 'export PERCY_BRANCH="${CIRCLE_BRANCH}"' >> "$BASH_ENV"
+      - unless:
+          condition:
+            or:
+              - equal:
+                  [
+                    "run_with_e2e_and_snapshots",
+                    << pipeline.parameters.GHA_Meta >>,
+                  ]
+              - equal:
+                  [
+                    "run_with_e2e_and_snapshots_deploy",
+                    << pipeline.parameters.GHA_Meta >>,
+                  ]
+          steps:
+            - run:
+                name: set PERCY_TOKEN empty string
+                command: echo 'export PERCY_TOKEN=""' >> "$BASH_ENV"
+      - run:
+          name: Pull integration test images
+          command: |
+            for i in $(seq 1 5); do \
+            env $(cat ./config/.env.test | xargs) docker-compose \
+              --env-file ./config/.env.test -f docker-compose.yml \
+              -f docker-compose-e2e.yml \
+              -f docker-compose-e2e-circleci.yml pull \
+            && s=0 && break || s=$? && sleep 10; done; (exit $s)
+      - run:
+          name: Run integration tests
+          command: |
+            env $(cat ./config/.env.test | xargs) docker-compose \
+              --env-file ./config/.env.test -f docker-compose.yml \
+              -f docker-compose-e2e.yml \
+              -f docker-compose-e2e-circleci.yml up \
+              --no-build \
+              --exit-code-from cypress web php db db_seeder frontend unicorn localstack cypress
+      - store_artifacts:
+          path: ./frontend/cypress/screenshots
+      - store_artifacts:
+          path: ./frontend/cypress/videos
+      - store_artifacts:
+          path: ./frontend/cypress/results
+      - store_test_results:
+          path: ./frontend/cypress/results
+  lint_web:
+    docker:
+      - image: cimg/php:8.3.9@sha256:0512cc9c4560b7c2f3508a44a091eced7fe4c5c603b1e9c528b2c462dc525b25
+    working_directory: ~/prodigy
+    steps:
+      - *restore-cache
+      - run:
+          name: Check for linter errors
+          command: ./vendor/bin/pint --test
+  build_frontend:
+    resource_class: large
+    environment:
+      IMAGE_NAME: frontend
+    <<: *build-docker
+  build_web:
+    environment:
+      IMAGE_NAME: web
+    <<: *build-docker
+  build_localstack:
+    environment:
+      IMAGE_NAME: localstack
+    <<: *build-docker
+  build_db_seeder:
+    environment:
+      IMAGE_NAME: db_seeder
+    <<: *build-docker
+  build_cypress:
+    environment:
+      IMAGE_NAME: cypress
+    <<: *build-docker
+  build_php:
+    environment:
+      IMAGE_NAME: php
+    <<: *build-docker
+  build_unicorn:
+    environment:
+      IMAGE_NAME: unicorn
+    <<: *build-docker
+  build_migrate:
+    environment:
+      IMAGE_NAME: migrate
+    <<: *build-docker
+  build_jobs:
+    environment:
+      IMAGE_NAME: jobs
+    <<: *build-docker
+  deploy-develop-web:
+    <<: *deploy-web
+  deploy-demo-web:
+    <<: *deploy-web
+  deploy-production-web:
+    <<: *deploy-web
+  deploy-develop-jobs:
+    <<: *deploy-jobs
+  deploy-demo-jobs:
+    <<: *deploy-jobs
+  deploy-production-jobs:
+    <<: *deploy-jobs
+  deploy-frontend-develop:
+    <<: *deploy-frontend
+  deploy-frontend-demo:
+    <<: *deploy-frontend
+  deploy-frontend-production:
+    <<: *deploy-frontend
+  migrate-develop:
+    <<: *migrate
+  migrate-demo:
+    <<: *migrate
+  migrate-production:
+    <<: *migrate
+executors:
+  prodigyems-docker:
+    docker:
+      - image: "prodigyems/docker:2.0.3@sha256:59980c07782c94d5ec4575bebed1ce00f21976ce820ee802af4292c99433054b"
+        environment:
+          ## this enables colors in the output
+          TERM: xterm
+workflows:
+  version: 2
+  testing:
+    when:
+      equal: ["run_without_e2e", << pipeline.parameters.GHA_Meta >>]
+    jobs:
+      - checkout_code
+      - lint_web:
+          requires:
+            - checkout_code
+      - lint_frontend:
+          requires:
+            - checkout_code
+      - lint_unicorn:
+          requires:
+            - checkout_code
+      - test_frontend:
+          requires:
+            - checkout_code
+      - build_frontend:
+          <<: *build-requires
+  testing-with-e2e:
+    when:
+      or:
+        - equal: ["run_with_e2e", << pipeline.parameters.GHA_Meta >>]
+        - equal:
+            ["run_with_e2e_and_snapshots", << pipeline.parameters.GHA_Meta >>]
+    jobs:
+      - checkout_code
+      - lint_web:
+          requires:
+            - checkout_code
+      - lint_frontend:
+          requires:
+            - checkout_code
+      - lint_unicorn:
+          requires:
+            - checkout_code
+      - test_frontend:
+          requires:
+            - checkout_code
+      - test_e2e:
+          requires:
+            - build_frontend
+            - build_web
+            - build_php
+            - build_unicorn
+            - build_migrate
+            - build_jobs
+            - build_localstack
+            - build_cypress
+            - build_db_seeder
+      - build_frontend:
+          <<: *build-requires
+      - build_web:
+          <<: *build-requires
+      - build_php:
+          <<: *build-requires
+      - build_unicorn:
+          <<: *build-requires
+      - build_migrate:
+          <<: *build-requires
+      - build_jobs:
+          <<: *build-requires
+      - build_localstack:
+          <<: *build-requires
+      - build_cypress:
+          <<: *build-requires
+      - build_db_seeder:
+          <<: *build-requires
+  build-deploy:
+    when:
+      equal:
+        [
+          "run_with_e2e_and_snapshots_deploy",
+          << pipeline.parameters.GHA_Meta >>,
+        ]
+    jobs:
+      - checkout_code
+      - lint_web:
+          requires:
+            - checkout_code
+      - lint_frontend:
+          requires:
+            - checkout_code
+      - lint_unicorn:
+          requires:
+            - checkout_code
+      - test_frontend:
+          requires:
+            - checkout_code
+      - test_e2e:
+          requires:
+            - build_frontend
+            - build_web
+            - build_php
+            - build_unicorn
+            - build_migrate
+            - build_jobs
+            - build_localstack
+            - build_cypress
+            - build_db_seeder
+      - build_frontend:
+          <<: *build-requires
+      - build_web:
+          <<: *build-requires
+      - build_php:
+          <<: *build-requires
+      - build_unicorn:
+          <<: *build-requires
+      - build_migrate:
+          <<: *build-requires
+      - build_jobs:
+          <<: *build-requires
+      - build_localstack:
+          <<: *build-requires
+      - build_cypress:
+          <<: *build-requires
+      - build_db_seeder:
+          <<: *build-requires
+      - hold: # <<< A job that will require manual approval in the CircleCI web application.
+          <<: *deploy-requires
+          type: approval # <<< This key-value pair will set your workflow to a status of "On Hold"
+          filters:
+            branches:
+              only: master
+      - deploy-develop-web:
+          context: develop-ctx
+          requires:
+            - migrate-develop
+          filters:
+            branches:
+              only:
+                - develop
+      - deploy-demo-web:
+          context: demo-ctx
+          requires:
+            - migrate-demo
+          filters:
+            branches:
+              only: master
+      - deploy-production-web:
+          context: production-ctx
+          requires:
+            - migrate-production
+          filters:
+            branches:
+              only: master
+      - deploy-develop-jobs:
+          context: develop-ctx
+          requires:
+            - migrate-develop
+          filters:
+            branches:
+              only:
+                - develop
+      - deploy-demo-jobs:
+          context: demo-ctx
+          requires:
+            - migrate-demo
+          filters:
+            branches:
+              only: master
+      - deploy-production-jobs:
+          context: production-ctx
+          requires:
+            - migrate-production
+          filters:
+            branches:
+              only: master
+      - deploy-frontend-develop:
+          context: develop-ctx
+          requires:
+            - deploy-develop-web
+          filters:
+            branches:
+              only: develop
+      - deploy-frontend-demo:
+          context: demo-ctx
+          requires:
+            - deploy-demo-web
+          filters:
+            branches:
+              only: master
+      - deploy-frontend-production:
+          context: production-ctx
+          requires:
+            - deploy-production-web
+          filters:
+            branches:
+              only: master
+      - migrate-develop:
+          context: develop-ctx
+          <<: *deploy-requires
+          filters:
+            branches:
+              only:
+                - develop
+      - migrate-demo:
+          context: demo-ctx
+          requires:
+            - hold
+          filters:
+            branches:
+              only: master
+      - migrate-production:
+          context: production-ctx
+          requires:
+            - hold
+          filters:
+            branches:
+              only: master
